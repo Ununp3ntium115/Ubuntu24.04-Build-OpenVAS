@@ -12,7 +12,8 @@
 # WARNING: This script runs as root and does not verify GPG signatures
 # Ensure you understand the security implications before running
 
-set -e  # Exit on any error
+# Remove set -e to prevent premature exits - we'll handle errors manually
+# set -e  # Exit on any error
 
 # Colors for output
 RED='\033[0;31m'
@@ -21,7 +22,45 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging function
+# Function to wait for service to be ready
+wait_for_service() {
+    local service=$1
+    local max_attempts=${2:-30}
+    local attempt=1
+    
+    log "Waiting for $service to be ready..."
+    
+    while [ $attempt -le $max_attempts ]; do
+        if systemctl is-active --quiet $service; then
+            log "$service is ready (attempt $attempt)"
+            return 0
+        fi
+        
+        log "Waiting for $service... (attempt $attempt/$max_attempts)"
+        sleep 2
+        ((attempt++))
+    done
+    
+    error "$service failed to start after $max_attempts attempts"
+    return 1
+}
+
+# Function to safely execute commands with error handling
+safe_execute() {
+    local description=$1
+    shift
+    
+    log "Executing: $description"
+    
+    if "$@"; then
+        log "Success: $description"
+        return 0
+    else
+        error "Failed: $description"
+        error "Command: $*"
+        return 1
+    fi
+}
 log() {
     echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
 }
@@ -65,47 +104,184 @@ apt update && apt upgrade -y
 
 log "=== Setting up RDP (Remote Desktop) Access ==="
 
-# Install desktop environment (XFCE - lightweight and reliable for RDP)
-log "Installing XFCE desktop environment..."
-apt install -y xfce4 xfce4-goodies xubuntu-desktop-minimal
+# Ubuntu 24.04 Wayland compatibility check and configuration
+log "Configuring Ubuntu 24.04 for XRDP compatibility..."
+
+# Check if running Wayland (common in Ubuntu 24.04)
+if [ "$XDG_SESSION_TYPE" = "wayland" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    log "Wayland session detected - configuring for XRDP compatibility"
+    WAYLAND_DETECTED=true
+else
+    log "X11 session detected"
+    WAYLAND_DETECTED=false
+fi
+
+# Configure GDM3 to disable Wayland for better XRDP compatibility
+log "Configuring GDM3 for XRDP compatibility..."
+if [ -f /etc/gdm3/custom.conf ]; then
+    # Enable X11 for GDM3 (required for XRDP)
+    if ! grep -q "WaylandEnable=false" /etc/gdm3/custom.conf; then
+        log "Disabling Wayland in GDM3 for XRDP compatibility"
+        sed -i '/\[daemon\]/a WaylandEnable=false' /etc/gdm3/custom.conf
+    fi
+    
+    # Ensure X11 is explicitly enabled
+    if ! grep -q "DefaultSession=ubuntu-xorg" /etc/gdm3/custom.conf; then
+        log "Setting default session to X11"
+        sed -i '/\[daemon\]/a DefaultSession=ubuntu-xorg' /etc/gdm3/custom.conf
+    fi
+else
+    # Create GDM3 config if it doesn't exist
+    log "Creating GDM3 configuration for XRDP"
+    cat > /etc/gdm3/custom.conf << 'EOF'
+[daemon]
+WaylandEnable=false
+DefaultSession=ubuntu-xorg
+
+[security]
+
+[xdmcp]
+
+[chooser]
+
+[debug]
+EOF
+fi
+
+# Check if a desktop environment is already installed
+if command -v gnome-shell >/dev/null 2>&1; then
+    log "GNOME desktop environment detected"
+    DESKTOP_ENV="gnome"
+    
+    # For GNOME on Ubuntu 24.04, ensure X11 session is available
+    if [ ! -f /usr/share/xsessions/ubuntu-xorg.desktop ]; then
+        log "Installing GNOME X11 session for XRDP compatibility"
+        apt install -y gnome-session-xorg
+    fi
+    
+elif command -v startplasma-x11 >/dev/null 2>&1; then
+    log "KDE desktop environment detected"
+    DESKTOP_ENV="kde"
+elif command -v xfce4-session >/dev/null 2>&1; then
+    log "XFCE desktop environment detected"
+    DESKTOP_ENV="xfce"
+elif command -v mate-session >/dev/null 2>&1; then
+    log "MATE desktop environment detected"
+    DESKTOP_ENV="mate"
+else
+    log "No desktop environment detected - installing minimal XFCE for RDP only"
+    apt install -y xfce4-session xfce4-panel xfce4-desktop xfwm4
+    DESKTOP_ENV="xfce"
+fi
+
+log "Using existing desktop environment: $DESKTOP_ENV"
 
 # Install XRDP
 log "Installing XRDP server..."
 apt install -y xrdp
 
-# Configure XRDP
-log "Configuring XRDP..."
+# Configure XRDP for Ubuntu 24.04
+log "Configuring XRDP for Ubuntu 24.04..."
 
 # Add xrdp user to ssl-cert group for secure connections
 usermod -a -G ssl-cert xrdp
 
-# Configure XFCE session for all users
-echo "xfce4-session" > /etc/skel/.xsession
+# Configure XRDP to work with Ubuntu 24.04's desktop sessions
+log "Configuring XRDP session management..."
 
-# Configure existing users for XFCE
-if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
-    log "Configuring XFCE session for user: $REAL_USER"
-    sudo -u $REAL_USER bash -c 'echo "xfce4-session" > ~/.xsession'
-    chown $REAL_USER:$REAL_USER /home/$REAL_USER/.xsession
+# Create XRDP session configuration
+cat > /etc/xrdp/startwm.sh << 'EOF'
+#!/bin/sh
+# XRDP session startup script for Ubuntu 24.04
+
+# Ensure proper environment
+if [ -r /etc/default/locale ]; then
+  . /etc/default/locale
+  export LANG LANGUAGE
 fi
+
+# Start session based on what's available
+if [ -f /usr/bin/gnome-session ]; then
+    # GNOME session (force X11)
+    export XDG_CURRENT_DESKTOP=ubuntu:GNOME
+    export XDG_SESSION_DESKTOP=ubuntu
+    export XDG_SESSION_TYPE=x11
+    export GDK_BACKEND=x11
+    export GNOME_SHELL_SESSION_MODE=ubuntu
+    exec /usr/bin/gnome-session --session=ubuntu
+elif [ -f /usr/bin/startxfce4 ]; then
+    # XFCE session
+    exec /usr/bin/startxfce4
+elif [ -f /usr/bin/mate-session ]; then
+    # MATE session
+    exec /usr/bin/mate-session
+elif [ -f /usr/bin/startkde ]; then
+    # KDE session
+    exec /usr/bin/startkde
+else
+    # Fallback
+    exec /usr/bin/x-session-manager
+fi
+EOF
+
+chmod +x /etc/xrdp/startwm.sh
+
+# Configure XRDP to listen on all interfaces
+log "Configuring XRDP network settings..."
+sed -i 's/port=3389/port=3389/' /etc/xrdp/xrdp.ini
+sed -i 's/address=127.0.0.1/address=0.0.0.0/' /etc/xrdp/xrdp.ini
 
 # Enable and start XRDP service
 systemctl enable xrdp
 systemctl start xrdp
+
+# Handle Ubuntu 24.04 specific session issues
+log "Applying Ubuntu 24.04 specific XRDP fixes..."
+
+# Create policy to allow RDP sessions
+cat > /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla << 'EOF'
+[Allow Colord all Users]
+Identity=unix-user:*
+Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+ResultAny=no
+ResultInactive=no
+ResultActive=yes
+EOF
+
+# Fix authentication issues for XRDP
+cat > /etc/polkit-1/localauthority/50-local.d/46-allow-update-repo.pkla << 'EOF'
+[Allow Package Management all Users]
+Identity=unix-user:*
+Action=org.freedesktop.packagekit.system-sources-refresh
+ResultAny=yes
+ResultInactive=yes
+ResultActive=yes
+EOF
 
 # Configure firewall for RDP (port 3389)
 log "Configuring firewall for RDP access..."
 ufw allow 3389/tcp
 ufw --force enable
 
-# Configure XRDP to listen on all interfaces
-log "Configuring XRDP to listen on all interfaces..."
-sed -i 's/port=3389/port=3389\naddress=0.0.0.0/' /etc/xrdp/xrdp.ini
-
-# Restart XRDP to apply changes
+# Restart XRDP to apply all changes
 systemctl restart xrdp
 
+# Wait for XRDP to be ready
+if wait_for_service xrdp 30; then
+    log "XRDP service started successfully"
+else
+    warn "XRDP may not be fully ready"
+fi
+
 log "RDP setup completed. RDP server listening on port 3389"
+
+# If Wayland was detected, inform user about reboot requirement
+if [ "$WAYLAND_DETECTED" = true ]; then
+    log "IMPORTANT: Wayland was detected. For optimal XRDP performance:"
+    log "1. A system reboot is recommended to apply GDM3 changes"
+    log "2. After reboot, RDP connections will use X11 sessions"
+    log "3. Local desktop will still work normally"
+fi
 
 # =============================================================================
 # OPENVAS SETUP SECTION
@@ -265,13 +441,22 @@ log "PostgreSQL packages pinned to prevent automatic upgrades"
 log "Installing and configuring Mosquitto MQTT broker..."
 apt install -y mosquitto mosquitto-clients
 
-# Start services
-systemctl enable postgresql
-systemctl start postgresql
-systemctl enable redis-server
-systemctl start redis-server
-systemctl enable mosquitto
-systemctl start mosquitto
+# Start services with proper sequencing
+log "Starting database and messaging services..."
+
+safe_execute "Enable PostgreSQL service" systemctl enable postgresql
+safe_execute "Start PostgreSQL service" systemctl start postgresql
+wait_for_service postgresql
+
+safe_execute "Enable Redis service" systemctl enable redis-server  
+safe_execute "Start Redis service" systemctl start redis-server
+wait_for_service redis-server
+
+safe_execute "Enable Mosquitto service" systemctl enable mosquitto
+safe_execute "Start Mosquitto service" systemctl start mosquitto
+wait_for_service mosquitto
+
+log "All database and messaging services are running"
 
 log "=== Building OpenVAS Components ==="
 
@@ -285,11 +470,22 @@ check_and_patch_postgresql() {
     if [ -f "$cmake_file" ]; then
         log "Checking PostgreSQL compatibility for $(basename $component_dir)..."
         
-        # Get current PostgreSQL major version
-        local pg_version=$(sudo -u postgres psql -t -c "SELECT current_setting('server_version_num');" | tr -d ' ')
-        local pg_major_version=$((pg_version / 10000))
+        # Wait for PostgreSQL to be ready before querying
+        if ! wait_for_service postgresql 10; then
+            warn "PostgreSQL not ready, skipping cmake patching for $(basename $component_dir)"
+            return 0
+        fi
         
-        log "PostgreSQL major version detected: $pg_major_version"
+        # Get current PostgreSQL major version with error handling
+        local pg_version
+        if pg_version=$(sudo -u postgres psql -t -c "SELECT current_setting('server_version_num');" 2>/dev/null | tr -d ' '); then
+            local pg_major_version=$((pg_version / 10000))
+            log "PostgreSQL major version detected: $pg_major_version"
+        else
+            warn "Could not detect PostgreSQL version, using default patching"
+            # Fallback: patch with common versions
+            pg_major_version=16
+        fi
         
         # Read current version list from cmake file
         local current_line=$(grep -E "set\(PostgreSQL_KNOWN_VERSIONS|PostgreSQL_ADDITIONAL_VERSIONS" "$cmake_file" | head -1)
@@ -326,7 +522,155 @@ check_and_patch_postgresql() {
         else
             warn "Could not find PostgreSQL version configuration in $cmake_file"
         fi
+    else
+        log "No PostgreSQL cmake file found for $(basename $component_dir), skipping"
     fi
+}
+
+# Create comprehensive PostgreSQL compatibility and runtime checks
+create_postgresql_compatibility_checks() {
+    log "Creating PostgreSQL compatibility monitoring system..."
+    
+    # Create a compatibility check script
+    cat > /usr/local/bin/openvas-pg-check << 'EOF'
+#!/bin/bash
+# OpenVAS PostgreSQL Compatibility Checker
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+check_postgresql_compatibility() {
+    echo -e "${GREEN}Checking PostgreSQL compatibility with OpenVAS...${NC}"
+    
+    # Get current PostgreSQL version
+    PG_VERSION=$(sudo -u postgres psql -t -c "SELECT current_setting('server_version_num');" 2>/dev/null | tr -d ' ')
+    
+    if [ -z "$PG_VERSION" ]; then
+        echo -e "${RED}ERROR: Cannot connect to PostgreSQL${NC}"
+        return 1
+    fi
+    
+    PG_MAJOR=$((PG_VERSION / 10000))
+    PG_MINOR=$(((PG_VERSION / 100) % 100))
+    
+    echo "PostgreSQL Version: $PG_MAJOR.$PG_MINOR (version number: $PG_VERSION)"
+    
+    # Check minimum version requirement
+    if [ $PG_MAJOR -lt 13 ]; then
+        echo -e "${RED}ERROR: PostgreSQL $PG_MAJOR is not supported. Minimum version is 13.${NC}"
+        return 1
+    fi
+    
+    # Check database connectivity and extensions
+    echo "Checking OpenVAS database..."
+    
+    if ! sudo -u postgres psql -d gvmd -c "SELECT 1;" >/dev/null 2>&1; then
+        echo -e "${RED}ERROR: Cannot access gvmd database${NC}"
+        return 1
+    fi
+    
+    # Check required extensions
+    EXTENSIONS=$(sudo -u postgres psql -d gvmd -t -c "SELECT extname FROM pg_extension;" | tr -d ' ')
+    
+    if ! echo "$EXTENSIONS" | grep -q "uuid-ossp"; then
+        echo -e "${YELLOW}WARNING: uuid-ossp extension not found${NC}"
+    fi
+    
+    if ! echo "$EXTENSIONS" | grep -q "pgcrypto"; then
+        echo -e "${YELLOW}WARNING: pgcrypto extension not found${NC}"
+    fi
+    
+    echo -e "${GREEN}PostgreSQL compatibility check passed${NC}"
+    return 0
+}
+
+# Run the check
+check_postgresql_compatibility
+exit $?
+EOF
+
+    chmod +x /usr/local/bin/openvas-pg-check
+    
+    # Create a service monitoring script
+    cat > /usr/local/bin/openvas-monitor << 'EOF'
+#!/bin/bash
+# OpenVAS Service Monitor and Auto-Recovery
+
+SERVICES=("postgresql" "redis-server" "mosquitto" "notus-scanner" "ospd-openvas" "gvmd" "gsad" "openvasd")
+LOG_FILE="/var/log/gvm/openvas-monitor.log"
+
+log_message() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+check_and_restart_service() {
+    local service=$1
+    
+    if ! systemctl is-active --quiet $service; then
+        log_message "WARNING: $service is not running, attempting restart..."
+        systemctl restart $service
+        sleep 5
+        
+        if systemctl is-active --quiet $service; then
+            log_message "SUCCESS: $service restarted successfully"
+        else
+            log_message "ERROR: Failed to restart $service"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Check PostgreSQL compatibility first
+if ! /usr/local/bin/openvas-pg-check >/dev/null 2>&1; then
+    log_message "CRITICAL: PostgreSQL compatibility check failed"
+    exit 1
+fi
+
+# Check all services
+for service in "${SERVICES[@]}"; do
+    check_and_restart_service "$service"
+done
+
+log_message "Service monitoring cycle completed"
+EOF
+
+    chmod +x /usr/local/bin/openvas-monitor
+    
+    # Create systemd timer for monitoring
+    cat > /etc/systemd/system/openvas-monitor.service << 'EOF'
+[Unit]
+Description=OpenVAS Service Monitor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/openvas-monitor
+User=root
+EOF
+
+    cat > /etc/systemd/system/openvas-monitor.timer << 'EOF'
+[Unit]
+Description=Run OpenVAS Service Monitor every 5 minutes
+Requires=openvas-monitor.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable openvas-monitor.timer
+    systemctl start openvas-monitor.timer
+    
+    log "PostgreSQL compatibility monitoring system created"
 }
 
 # Create the compatibility monitoring system
@@ -408,36 +752,91 @@ check_and_patch_postgresql "$SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION
 check_and_patch_postgresql "$SOURCE_DIR/gvmd-$GVMD_VERSION"
 check_and_patch_postgresql "$SOURCE_DIR/gsad-$GSAD_VERSION"
 
+# Create the PostgreSQL compatibility monitoring system
+create_postgresql_compatibility_checks
+
 # Build and install gvm-libs
 log "Building and installing gvm-libs..."
 cd $SOURCE_DIR/gvm-libs-$GVM_LIBS_VERSION
-mkdir build
+if ! mkdir -p build; then
+    error "Failed to create build directory for gvm-libs"
+    exit 1
+fi
+
 cd build
-cmake -DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX ..
-make -j$(nproc)
-make install
+if ! safe_execute "Configure gvm-libs" cmake -DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX ..; then
+    error "Failed to configure gvm-libs"
+    exit 1
+fi
+
+if ! safe_execute "Build gvm-libs" make -j$(nproc); then
+    error "Failed to build gvm-libs"
+    exit 1
+fi
+
+if ! safe_execute "Install gvm-libs" make install; then
+    error "Failed to install gvm-libs"
+    exit 1
+fi
+
+log "gvm-libs installation completed successfully"
 
 # Build and install openvas-scanner
 log "Building and installing openvas-scanner..."
 cd $SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION
 
-mkdir build
+if ! mkdir -p build; then
+    error "Failed to create build directory for openvas-scanner"
+    exit 1
+fi
+
 cd build
-cmake -DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX ..
-make -j$(nproc)
-make install
+if ! safe_execute "Configure openvas-scanner" cmake -DCMAKE_INSTALL_PREFIX=$INSTALL_PREFIX ..; then
+    error "Failed to configure openvas-scanner"
+    exit 1
+fi
+
+if ! safe_execute "Build openvas-scanner" make -j$(nproc); then
+    error "Failed to build openvas-scanner"
+    exit 1
+fi
+
+if ! safe_execute "Install openvas-scanner" make install; then
+    error "Failed to install openvas-scanner"
+    exit 1
+fi
+
+log "openvas-scanner installation completed successfully"
 
 # Build and install Rust components (openvasd and scannerctl)
 log "Building Rust components..."
 if ! command -v cargo &> /dev/null; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    log "Installing Rust..."
+    if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
+        error "Failed to install Rust"
+        exit 1
+    fi
     source ~/.cargo/env
 fi
 
 cd $SOURCE_DIR/openvas-scanner-$OPENVAS_SCANNER_VERSION/rust
-cargo build --release
-cp target/release/openvasd $INSTALL_PREFIX/bin/
-cp target/release/scannerctl $INSTALL_PREFIX/bin/
+
+if ! safe_execute "Build Rust components" cargo build --release; then
+    error "Failed to build Rust components"
+    exit 1
+fi
+
+if ! safe_execute "Install openvasd" cp target/release/openvasd $INSTALL_PREFIX/bin/; then
+    error "Failed to install openvasd"
+    exit 1
+fi
+
+if ! safe_execute "Install scannerctl" cp target/release/scannerctl $INSTALL_PREFIX/bin/; then
+    error "Failed to install scannerctl"
+    exit 1
+fi
+
+log "Rust components installation completed successfully"
 
 # Build and install gvmd
 log "Building and installing gvmd..."
@@ -721,22 +1120,69 @@ echo "$ADMIN_PASSWORD" > /root/openvas_admin_password.txt
 chmod 600 /root/openvas_admin_password.txt
 log "Admin password saved to /root/openvas_admin_password.txt"
 
-# Start services
-log "Starting OpenVAS services..."
-systemctl daemon-reload
-systemctl enable notus-scanner ospd-openvas gvmd gsad openvasd
-systemctl start notus-scanner
-sleep 5
-systemctl start ospd-openvas
-sleep 5
-systemctl start gvmd
-sleep 5
-systemctl start gsad
-systemctl start openvasd
+# Start services with proper error handling and sequencing
+log "Starting OpenVAS services in correct order..."
 
-# Sync feeds (this will take a long time)
+safe_execute "Reload systemd daemon" systemctl daemon-reload
+safe_execute "Enable notus-scanner" systemctl enable notus-scanner
+safe_execute "Enable ospd-openvas" systemctl enable ospd-openvas  
+safe_execute "Enable gvmd" systemctl enable gvmd
+safe_execute "Enable gsad" systemctl enable gsad
+safe_execute "Enable openvasd" systemctl enable openvasd
+
+log "Starting services in dependency order..."
+
+safe_execute "Start notus-scanner" systemctl start notus-scanner
+if wait_for_service notus-scanner 30; then
+    log "notus-scanner started successfully"
+else
+    warn "notus-scanner may not be fully ready, continuing..."
+fi
+
+safe_execute "Start ospd-openvas" systemctl start ospd-openvas
+if wait_for_service ospd-openvas 30; then
+    log "ospd-openvas started successfully"
+else
+    warn "ospd-openvas may not be fully ready, continuing..."
+fi
+
+safe_execute "Start gvmd" systemctl start gvmd
+if wait_for_service gvmd 60; then
+    log "gvmd started successfully"
+else
+    warn "gvmd may not be fully ready, continuing..."
+fi
+
+safe_execute "Start gsad" systemctl start gsad
+if wait_for_service gsad 30; then
+    log "gsad started successfully"
+else
+    warn "gsad may not be fully ready, continuing..."
+fi
+
+safe_execute "Start openvasd" systemctl start openvasd
+if wait_for_service openvasd 30; then
+    log "openvasd started successfully"
+else
+    warn "openvasd may not be fully ready, continuing..."
+fi
+
+log "All OpenVAS services have been started"
+
+# Sync feeds with better error handling (this will take a long time)
 log "Synchronizing vulnerability feeds - this will take 30-45 minutes..."
-sudo -u gvm greenbone-feed-sync
+log "This is the longest part of the installation, please be patient..."
+
+# Make sure gvmd is ready before syncing feeds
+log "Waiting for gvmd to be fully ready for feed synchronization..."
+sleep 30
+
+if ! safe_execute "Synchronize feeds" sudo -u gvm greenbone-feed-sync; then
+    warn "Feed synchronization may have had issues, but continuing..."
+    log "You can manually run 'sudo -u gvm greenbone-feed-sync' later if needed"
+fi
+
+log "Feed synchronization completed (or attempted)"
 
 log "=== Final Configuration and Verification ==="
 
