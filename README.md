@@ -6,7 +6,7 @@ No desktop interference or session conflicts
 Passwordless sudo for OpenVAS service management
 Management tools accessible via SSH
 
-2. Learned from Your Experience
+
 
 PostgreSQL compatibility for any version (auto-detects and adapts)
 Correct feed versioning (22.04 format to avoid JSON/XML mismatch)
